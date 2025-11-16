@@ -160,8 +160,8 @@ func (a ATESLMessenger) processTrackingEvent(t trackingEvent, l *ATESLLastPredic
 		}
 
 		// TODO - send the thumbnail - for now just log the dimensions
-		tn := getThumbnail(t.ClipId, t.TrackId)
-		log.Infof("Thumbnail is: %d×%d", len(tn), len(tn[0]))
+		//tn := getThumbnail(t.ClipId, t.TrackId)
+		//log.Infof("Thumbnail is: %d×%d", len(tn), len(tn[0]))
 
 		// Now let's check the event lockout
 		l.Lockout = getPredictionEventLockout(a.BaudRate)
