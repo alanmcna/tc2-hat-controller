@@ -17,6 +17,7 @@ type models struct {
 }
 
 var (
+	labelsLoaded  = false
 	animalsList   = models{Id: 1, Labels: []string{"bird", "cat", "deer", "dog", "false-positive", "hedgehog", "human", "kiwi", "leporidae", "mustelid", "penguin", "possum", "rodent", "sheep", "vehicle", "wallaby"}}
 	fpModelLabels = models{Id: 1004, Labels: []string{"animal", "false-positive"}}
 )
@@ -49,23 +50,25 @@ type batteryEvent struct {
 	Percent float64
 }
 
+var labelSignalName = "org.cacophony.thermalrecorder.LabelsUpdated"
+
 // Add tracking reprocessed events to the channel
 // Tracking reprocessed events are sent once the track has finished and it gets reprocessed.
 // This is useful if you are just using the events for reporting purposes and don't need to control
 // something in real time.
 func addTrackingReprocessedEvents(eventsChan chan event) error {
 	targetSignalName := "org.cacophony.thermalrecorder.TrackingReprocessed"
-	return addTrackingEventsForSignal(eventsChan, targetSignalName)
+	return addTrackingEventsForSignal(eventsChan, targetSignalName, labelSignalName)
 }
 
 // Add tracking events to the channel
 // Tracking events are sent while the track is in progress.
 func addTrackingEvents(eventsChan chan event) error {
 	targetSignalName := "org.cacophony.thermalrecorder.Tracking"
-	return addTrackingEventsForSignal(eventsChan, targetSignalName)
+	return addTrackingEventsForSignal(eventsChan, targetSignalName, labelSignalName)
 }
 
-func addTrackingEventsForSignal(eventsChan chan event, targetSignalName string) error {
+func addTrackingEventsForSignal(eventsChan chan event, targetSignalName string, labelsEventName string) error {
 
 	// Connect to the system bus
 	conn, err := dbus.SystemBus()
@@ -85,7 +88,7 @@ func addTrackingEventsForSignal(eventsChan chan event, targetSignalName string) 
 	conn.Signal(c)
 
 	// Listen for signals
-	log.Infof("Listening for D-Bus signals: %s", targetSignalName)
+	log.Infof("Listening for D-Bus signals: %s and %s", targetSignalName, labelsEventName)
 
 	// Get the latest classification labels if we need them
 	log.Info("Getting latest classification labels")
@@ -94,6 +97,9 @@ func addTrackingEventsForSignal(eventsChan chan event, targetSignalName string) 
 	// Listen for signals, process and send tracking events to the channel.
 	go func() {
 		for signal := range c {
+			if signal.Name == labelsEventName || !labelsLoaded {
+				getLabels()
+			}
 			if signal.Name == targetSignalName {
 				log.Debugf("Received tracking event [%v]:", signal.Name)
 
@@ -322,6 +328,7 @@ func getLabels() {
 			log.Warnf("Unexpected classification label id: %v, with labels: %v", k, bodyMap)
 		}
 	}
+	labelsLoaded = true
 	log.Infof("Classification labels updated: animalsList: %+v, fpModelLabels: %+v", animalsList, fpModelLabels)
 }
 
