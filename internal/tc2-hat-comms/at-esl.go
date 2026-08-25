@@ -13,11 +13,21 @@ import (
 )
 
 var (
-	predictionLockoutNodeRegister     int   = 5
-	predictionLockoutMinutesDefault   int64 = 30 // default 30mins.
-	batteryLockoutHoursNodeRegister   int   = 12
-	batteryLockoutMinutesNodeRegister int   = 13
+	// Node register addresses (hex), matching cmdpro wXX / mXX dump lines.
+	// 0x05 = EVENT_LOCKOUT_MINS (prediction).
+	// 0x12/0x13 = HOURS/MINS_PER_INST_READING — battery is an instrument reading;
+	// these set how often we report those readings.
+	predictionLockoutNodeRegister     int   = 0x05
+	predictionLockoutMinutesDefault   int64 = 1 // default 1min.
+
+	batteryLockoutHoursNodeRegister   int   = 0x12
+	batteryLockoutMinutesNodeRegister int   = 0x13
 	batteryLockoutMinutesDefault      int64 = 180 // default 180mins (3 hours).
+
+	// Pause after AT wake before the real command so the node can leave the wake
+	// O^K and accept AT+XCMD / AT+CAM.
+	atPostWakeSettle = 50 * time.Millisecond
+	atPostRegTimeout = 2000 * time.Millisecond
 )
 
 type ATESLMessenger struct {
@@ -107,8 +117,8 @@ func (a ATESLMessenger) processBatteryEvent(b batteryEvent, l *ATESLLastBattery)
 	l.Voltage = b.Voltage // Remember the voltage reading
 	l.When = time.Now()   // Remember when we detected it
 
-	// Now let's check the event lockout
-	l.Lockout = getBatteryEventLockout(a.BaudRate)
+	// Re-query lockout (hub may have changed w12/w13); keep last-good on failure.
+	l.Lockout = getBatteryEventLockout(a.BaudRate, l.Lockout)
 
 	return nil
 }
@@ -181,8 +191,8 @@ func (a ATESLMessenger) processTrackingEvent(t trackingEvent, l *ATESLLastPredic
 		//tn := getThumbnail(t.ClipId, t.TrackId)
 		//log.Infof("Thumbnail is: %d×%d", len(tn), len(tn[0]))
 
-		// Now let's check the event lockout
-		l.Lockout = getPredictionEventLockout(a.BaudRate)
+		// Re-query lockout (hub may have changed w05); keep last-good on failure.
+		l.Lockout = getPredictionEventLockout(a.BaudRate, l.Lockout)
 	}
 
 	return nil
@@ -202,7 +212,6 @@ func sendATWakeUp(baudRate int) error {
 		err := serialhelper.SerialSend(1, gpio.High, gpio.Low, 10*time.Second, payload, baudRate)
 		attempt = attempt + 1
 
-		// response, err := serialhelper.SerialSendReceive(1, gpio.High, gpio.Low, 10*time.Second, payload, baudRate)
 		if err != nil {
 			return fmt.Errorf("serial send error: %w", err)
 		}
@@ -231,11 +240,18 @@ func sendATCommand(command string, baudRate int) ([]byte, error) {
 		return response, fmt.Errorf("could not wake serial receiver: %w", err)
 	}
 
-	// O^K now send the AT command
-	payload := append([]byte(command), byte('\r'))
-	log.Infof("Sending AT command: %s", command)
+	// Give the node time to finish the wake O^K and be ready for the next AT command.
+	time.Sleep(atPostWakeSettle)
 
-	response, err = serialhelper.SerialSendReceive(1, gpio.High, gpio.Low, 5*time.Second, payload, baudRate)
+	// O^K now send the AT command. Drain clears wake leftover; read until O^K/E^RROR
+	// so multi-line responses (e.g. m00 register dump) are kept intact.
+	payload := append([]byte(command), byte('\r'))
+	log.Infof("Sending AT command: %q", command)
+
+	response, err = serialhelper.SerialSendReceiveUntil(
+		1, gpio.High, gpio.Low, 0*time.Second, payload, baudRate, atPostRegTimeout,
+		[]byte("O^K"), []byte("E^RROR"),
+	)
 	if err != nil {
 		return response, fmt.Errorf("serial send receive error: %w", err)
 	}
@@ -258,64 +274,172 @@ func sendATCommand(command string, baudRate int) ([]byte, error) {
 	return response, nil
 }
 
-func getRegisteryData(baudRate int, reg int) int64 {
-	regCmd := "m00"
-
-	// Currently limited to the first 'page' of registery data (m00)
-	cmd := append([]byte("AT+XCMD="+regCmd), calcCRC16([]byte(regCmd))...)
-	log.Infof("get reg %d, data via command %v", reg, cmd)
-
-	response, _ := sendATCommand(string(cmd), baudRate)
-
-	// Let's clean-up the output - trim any unwanted charaters
-	if idx := bytes.Index(response, []byte(regCmd+"\r\n\r\n")); idx != -1 {
-		response = response[idx:]
-	} else {
-		// fallback: not found, just log and continue
-		log.Warnf("Registry command marker [%v] not found; keeping full response", regCmd)
+// parseRegistryByte extracts one register byte from an mXX hex dump.
+// reg is the node register address (e.g. 0x05, 0x12). Value 0xff is treated as unset (0).
+//
+// Rows are matched on their absolute label ("10:" holds 0x10-0x1f). Dumps are
+// requested row-aligned, so if the node labels rows relative to the request
+// instead the first dump row is still the row we asked for, and is used as a
+// fallback.
+func parseRegistryByte(response []byte, reg int) (int64, error) {
+	if len(response) == 0 {
+		return 0, fmt.Errorf("empty registry response")
 	}
 
-	col := reg % 10
-	row := 0
-	if reg > 10 {
-		row = reg / (reg - (reg % 10))
-	}
+	addr := reg & 0xff
+	col := addr & 0x0f
+	prefix := fmt.Sprintf("%02x:", addr&0xf0)
 
-	// w05..
-	// response.. \xa5\xfc\r\nm00\r\n\r\n00: ff ff ff ff ff 02
-	// First, second, third or fourth row of node register block - 00:
-	seq := fmt.Sprintf("%02x:", row*16)
-	pos := 0
-
-	log.Debugf("Searching for %v in response", seq)
-	for i := 0; i <= len(response)-3; i++ {
-		if response[i] == seq[0] && response[i+1] == seq[1] && response[i+2] == seq[2] {
-			log.Debugf("Found %v - position: %d", seq, i)
-			pos = i + 3 + col*3 + 1 // aka it's the nth element + drop the leading space
-			break
+	var firstRow []string
+	scanner := bufio.NewScanner(bytes.NewReader(response))
+	for scanner.Scan() {
+		lower := strings.ToLower(strings.TrimSpace(scanner.Text()))
+		if !isRegistryRow(lower) {
+			continue
+		}
+		fields := strings.Fields(lower)
+		if firstRow == nil {
+			firstRow = fields
+		}
+		if strings.HasPrefix(lower, prefix) {
+			return registryColumn(fields, addr, col)
 		}
 	}
-
-	hexstr := string(response[pos : pos+2])
-	reg_value, err := strconv.ParseInt(hexstr, 16, 64)
-	log.Debugf("Converted %v to int value: %d", hexstr, reg_value)
-
-	if err != nil {
-		log.Errorf("parseInt error: %v", err)
-		reg_value = 0
-	} else if reg_value == 255 {
-		reg_value = 0
-		log.Debugf("Reg value is 255 (FF) re-setting int value: %d", reg_value)
+	if err := scanner.Err(); err != nil {
+		return 0, err
 	}
-	log.Infof("Reg value = %d", reg_value)
+	if firstRow != nil {
+		// Only reachable if the node relabels rows; warn since it also looks like
+		// a node that ignored the requested row and dumped from 0x00 instead.
+		log.Warnf("Registry row %s absent; reading column %d of first dump row %q", prefix, col, firstRow[0])
+		return registryColumn(firstRow, addr, col)
+	}
+	return 0, fmt.Errorf("registry row %s not found in response", prefix)
+}
 
-	return reg_value
+// isRegistryRow reports whether line starts with a two hex digit row label such
+// as "10:", so echoed commands and status lines are skipped.
+func isRegistryRow(line string) bool {
+	if len(line) < 3 || line[2] != ':' {
+		return false
+	}
+	_, err := strconv.ParseUint(line[:2], 16, 8)
+	return err == nil
+}
+
+// registryColumn reads column col of a dump row, where fields[0] is the row
+// label. addr is only used for logging.
+func registryColumn(fields []string, addr, col int) (int64, error) {
+	if len(fields) < col+2 {
+		return 0, fmt.Errorf("registry row %q too short for column %d", strings.Join(fields, " "), col)
+	}
+	hexstr := fields[col+1]
+	if len(hexstr) != 2 {
+		return 0, fmt.Errorf("invalid hex byte %q in row %q", hexstr, strings.Join(fields, " "))
+	}
+	regValue, err := strconv.ParseInt(hexstr, 16, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parseInt %q: %w", hexstr, err)
+	}
+	if regValue == 255 {
+		log.Infof("Reg 0x%02x = 0 (FF unset) from %s", addr, formatRegistryRow(fields, col))
+		return 0, nil
+	}
+	log.Infof("Reg 0x%02x = %d (0x%02x) from %s", addr, regValue, uint8(regValue), formatRegistryRow(fields, col))
+	return regValue, nil
+}
+
+// formatRegistryRow rebuilds a dump line with the selected column in [brackets].
+func formatRegistryRow(fields []string, col int) string {
+	if len(fields) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(fields[0])
+	for i, hexstr := range fields[1:] {
+		b.WriteByte(' ')
+		if i == col {
+			b.WriteByte('[')
+			b.WriteString(hexstr)
+			b.WriteByte(']')
+		} else {
+			b.WriteString(hexstr)
+		}
+	}
+	return b.String()
+}
+
+// registryDumpCommand returns the mXX command that dumps the 16-byte row
+// containing reg. The node wants two digits but ignores the low one, so the row
+// is selected by the high nibble (0x12 → "m10").
+func registryDumpCommand(reg int) string {
+	return fmt.Sprintf("m%02x", reg&0xf0)
+}
+
+const (
+	xcmdFlag = 0x7e
+	xcmdESC  = 0x1b
+)
+
+// byteStuffXCMD prefixes CH_FLAG (0x7e) before flag/CR/LF/ESC so the node's
+// AT parser does not treat those bytes as end-of-frame. Matches serial_node.py
+// and hub-and-node atproc.c / rfid.c destuff (flag_escaped).
+func byteStuffXCMD(msg []byte) []byte {
+	out := make([]byte, 0, len(msg)+4)
+	for _, c := range msg {
+		if c == xcmdFlag || c == '\r' || c == '\n' || c == xcmdESC {
+			out = append(out, xcmdFlag)
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// encodeATXCMD builds AT+XCMD=<cmd><crc16>, stuffing only the command+CRC.
+// CRC is computed on the unstuffed command. The AT line terminator is not stuffed;
+// sendATCommand appends that CR afterwards.
+func encodeATXCMD(cmd string) []byte {
+	body := []byte(cmd)
+	body = append(body, calcCRC16(body)...)
+	return append([]byte("AT+XCMD="), byteStuffXCMD(body)...)
+}
+
+// fetchRegistryDump requests the register row containing reg. The node prints
+// ~80 bytes from the row start, so one dump covers all 16 registers in the row.
+func fetchRegistryDump(baudRate int, reg int) ([]byte, error) {
+	regCmd := registryDumpCommand(reg)
+	cmd := encodeATXCMD(regCmd)
+	log.Infof("fetch registry dump for 0x%02x via command %s (%q)", reg&0xff, regCmd, cmd)
+
+	response, err := sendATCommand(string(cmd), baudRate)
+	if err != nil {
+		return response, err
+	}
+	if len(response) == 0 {
+		return response, fmt.Errorf("empty response to %s", regCmd)
+	}
+	return response, nil
+}
+
+func getRegisteryData(baudRate int, reg int) (int64, bool) {
+	response, err := fetchRegistryDump(baudRate, reg)
+	if err != nil {
+		log.Warnf("registry read failed for 0x%02x: %v", reg, err)
+		return 0, false
+	}
+
+	regValue, err := parseRegistryByte(response, reg)
+	if err != nil {
+		log.Warnf("registry parse failed for 0x%02x: %v (response %q)", reg, err, string(response))
+		return 0, false
+	}
+	return regValue, true
 }
 
 /*
 
    Prediction event lockout mins
-   Time in minutes to have an prediction event lockout; default 30mins.
+   Time in minutes to have an prediction event lockout; default 1min.
    Read the 05 node registery to get the value
 
    2min = 'w0502’
@@ -324,40 +448,52 @@ func getRegisteryData(baudRate int, reg int) int64 {
 
 */
 
-func getPredictionEventLockout(baudRate int) int64 {
-
-	lockout_minutes := getRegisteryData(baudRate, predictionLockoutNodeRegister)
-
-	if lockout_minutes == 0 {
-		lockout_minutes = predictionLockoutMinutesDefault
+func getPredictionEventLockout(baudRate int, current int64) int64 {
+	lockoutMinutes, ok := getRegisteryData(baudRate, predictionLockoutNodeRegister)
+	if !ok {
+		log.Warnf("Prediction lockout read failed - retaining %d", current)
+		return current
+	}
+	if lockoutMinutes == 0 {
+		lockoutMinutes = predictionLockoutMinutesDefault
 		log.Infof("Prediction lockout time not set - using default (%d)", predictionLockoutMinutesDefault)
 	}
 
-	log.Infof("Prediction lockout time = %d (mins)", lockout_minutes)
-	return lockout_minutes
+	log.Infof("Prediction lockout time = %d (mins)", lockoutMinutes)
+	return lockoutMinutes
 }
 
 /*
-Battery event lockout mins
-Time in minutes to have an battery event lockout; default 180mins (3 hours).
-Read the 12 (hrs) + 13 (mins) node registery to get the value
+Battery / instrument reading interval.
+Default 180mins (3 hours). Read 0x12 (hrs) + 0x13 (mins) = HOURS/MINS_PER_INST_READING.
+Battery voltage is reported as an instrument reading, so this interval gates how often we send it.
 
 3hours = 'w1203’
 30min = 'w131e’
 */
-func getBatteryEventLockout(baudRate int) int64 {
-
-	hours := getRegisteryData(baudRate, batteryLockoutHoursNodeRegister)
-	mins := getRegisteryData(baudRate, batteryLockoutMinutesNodeRegister)
-
-	battery_lockout_minutes := hours*60 + mins
-	if battery_lockout_minutes <= 0 {
-		log.Infof("Battery lockout time not set - using default (%d)", batteryLockoutMinutesDefault)
-		battery_lockout_minutes = batteryLockoutMinutesDefault
+func getBatteryEventLockout(baudRate int, current int64) int64 {
+	// 0x12 and 0x13 share row 1, so a single m10 dump covers both.
+	response, err := fetchRegistryDump(baudRate, batteryLockoutHoursNodeRegister)
+	if err != nil {
+		log.Warnf("Battery lockout registry read failed - retaining %d: %v", current, err)
+		return current
 	}
 
-	log.Infof("Battery lockout time = %d (mins)", battery_lockout_minutes)
-	return battery_lockout_minutes
+	hours, errH := parseRegistryByte(response, batteryLockoutHoursNodeRegister)
+	mins, errM := parseRegistryByte(response, batteryLockoutMinutesNodeRegister)
+	if errH != nil || errM != nil {
+		log.Warnf("Battery lockout parse failed - retaining %d (hours=%v mins=%v)", current, errH, errM)
+		return current
+	}
+
+	batteryLockoutMinutes := hours*60 + mins
+	if batteryLockoutMinutes <= 0 {
+		log.Infof("Battery lockout time not set - using default (%d)", batteryLockoutMinutesDefault)
+		batteryLockoutMinutes = batteryLockoutMinutesDefault
+	}
+
+	log.Infof("Battery lockout time = %d (mins)", batteryLockoutMinutes)
+	return batteryLockoutMinutes
 }
 
 func feedCRC16(crc uint16, dat byte) uint16 {
